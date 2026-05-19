@@ -18,6 +18,8 @@ dependencies = [
     
     # Zep Cloud
     "zep-cloud==3.13.0",
+    # Local Graphiti temporal graph provider
+    "graphiti-core==0.13.2",
     
     # OASIS 社交媒体模拟
     "camel-oasis==0.2.5",

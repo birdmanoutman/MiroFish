@@ -16,11 +16,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from openai import OpenAI
-from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
+from .graph_memory_provider import GraphMemorySearchOptions, create_graph_memory_provider
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -198,16 +198,16 @@ class OasisProfileGenerator:
             base_url=self.base_url
         )
         
-        # Zep客户端用于检索丰富上下文
+        # 图谱记忆 provider 用于检索丰富上下文
         self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
         self.zep_client = None
         self.graph_id = graph_id
         
-        if self.zep_api_key:
+        if Config.validate_graph_memory() == []:
             try:
-                self.zep_client = Zep(api_key=self.zep_api_key)
+                self.zep_client = create_graph_memory_provider(api_key=zep_api_key)
             except Exception as e:
-                logger.warning(f"Zep客户端初始化失败: {e}")
+                logger.warning(f"图谱记忆 provider 初始化失败: {e}")
     
     def generate_profile_from_entity(
         self, 
@@ -324,12 +324,10 @@ class OasisProfileGenerator:
             
             for attempt in range(max_retries):
                 try:
-                    return self.zep_client.graph.search(
-                        query=comprehensive_query,
+                    return self.zep_client.search_graph(
                         graph_id=self.graph_id,
-                        limit=30,
-                        scope="edges",
-                        reranker="rrf"
+                        query=comprehensive_query,
+                        options=GraphMemorySearchOptions(limit=30, scope="edges", reranker="rrf")
                     )
                 except Exception as e:
                     last_exception = e
@@ -349,12 +347,10 @@ class OasisProfileGenerator:
             
             for attempt in range(max_retries):
                 try:
-                    return self.zep_client.graph.search(
-                        query=comprehensive_query,
+                    return self.zep_client.search_graph(
                         graph_id=self.graph_id,
-                        limit=20,
-                        scope="nodes",
-                        reranker="rrf"
+                        query=comprehensive_query,
+                        options=GraphMemorySearchOptions(limit=20, scope="nodes", reranker="rrf")
                     )
                 except Exception as e:
                     last_exception = e
@@ -1202,4 +1198,3 @@ class OasisProfileGenerator:
         """[已废弃] 请使用 save_profiles() 方法"""
         logger.warning("save_profiles_to_json已废弃，请使用save_profiles方法")
         self.save_profiles(profiles, file_path, platform)
-

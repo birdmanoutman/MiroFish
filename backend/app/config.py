@@ -32,8 +32,25 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
     
+    # Graph memory配置。生产默认使用本地 Graphiti；Zep Cloud 保留为回退。
+    MEMORY_PROVIDER = os.environ.get('MEMORY_PROVIDER', 'graphiti').lower()
+
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+
+    # Graphiti配置
+    GRAPHITI_BASE_URL = os.environ.get('GRAPHITI_BASE_URL', 'http://127.0.0.1:8010')
+    GRAPHITI_NEO4J_URI = os.environ.get('GRAPHITI_NEO4J_URI', 'bolt://127.0.0.1:17687')
+    GRAPHITI_NEO4J_USER = os.environ.get('GRAPHITI_NEO4J_USER', 'neo4j')
+    GRAPHITI_NEO4J_PASSWORD = os.environ.get('GRAPHITI_NEO4J_PASSWORD')
+    GRAPHITI_API_KEY = os.environ.get('GRAPHITI_API_KEY')
+    GRAPHITI_LLM_BASE_URL = os.environ.get('GRAPHITI_LLM_BASE_URL', LLM_BASE_URL)
+    GRAPHITI_LLM_MODEL_NAME = os.environ.get('GRAPHITI_LLM_MODEL_NAME', 'gpt-4.1-mini')
+    GRAPHITI_SMALL_MODEL_NAME = os.environ.get('GRAPHITI_SMALL_MODEL_NAME', 'gpt-4.1-nano')
+    GRAPHITI_EMBEDDING_BASE_URL = os.environ.get('GRAPHITI_EMBEDDING_BASE_URL', LLM_BASE_URL)
+    GRAPHITI_EMBEDDING_MODEL = os.environ.get('GRAPHITI_EMBEDDING_MODEL', 'text-embedding-3-small')
+    GRAPHITI_EMBEDDING_DIM = int(os.environ.get('GRAPHITI_EMBEDDING_DIM', '1024'))
+    GRAPHITI_EPISODE_TIMEOUT_SECONDS = int(os.environ.get('GRAPHITI_EPISODE_TIMEOUT_SECONDS', '90'))
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -69,7 +86,25 @@ class Config:
         errors = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
+        errors.extend(cls.validate_graph_memory())
         return errors
 
+    @classmethod
+    def validate_graph_memory(cls):
+        """按当前 memory provider 验证图谱记忆配置。"""
+        errors = []
+        if cls.MEMORY_PROVIDER == 'zep':
+            if not cls.ZEP_API_KEY:
+                errors.append("ZEP_API_KEY 未配置")
+        elif cls.MEMORY_PROVIDER == 'graphiti':
+            if not cls.GRAPHITI_NEO4J_URI:
+                errors.append("GRAPHITI_NEO4J_URI 未配置")
+            if not cls.GRAPHITI_NEO4J_USER:
+                errors.append("GRAPHITI_NEO4J_USER 未配置")
+            if not cls.GRAPHITI_NEO4J_PASSWORD:
+                errors.append("GRAPHITI_NEO4J_PASSWORD 未配置")
+            if not (cls.GRAPHITI_API_KEY or cls.LLM_API_KEY):
+                errors.append("GRAPHITI_API_KEY 或 LLM_API_KEY 未配置")
+        else:
+            errors.append(f"MEMORY_PROVIDER 不支持: {cls.MEMORY_PROVIDER}")
+        return errors

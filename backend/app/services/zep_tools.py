@@ -13,13 +13,11 @@ import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
-from zep_cloud.client import Zep
-
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_locale, t
-from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
+from .graph_memory_provider import GraphMemorySearchOptions, create_graph_memory_provider
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -423,11 +421,8 @@ class ZepToolsService:
     RETRY_DELAY = 2.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.api_key = api_key
+        self.provider = create_graph_memory_provider(api_key=api_key)
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info(t("console.zepToolsInitialized"))
@@ -488,12 +483,10 @@ class ZepToolsService:
         # 尝试使用Zep Cloud Search API
         try:
             search_results = self._call_with_retry(
-                func=lambda: self.client.graph.search(
+                func=lambda: self.provider.search_graph(
                     graph_id=graph_id,
                     query=query,
-                    limit=limit,
-                    scope=scope,
-                    reranker="cross_encoder"
+                    options=GraphMemorySearchOptions(limit=limit, scope=scope, reranker="cross_encoder")
                 ),
                 operation_name=t("console.graphSearchOp", graphId=graph_id)
             )
@@ -659,7 +652,7 @@ class ZepToolsService:
         """
         logger.info(t("console.fetchingAllNodes", graphId=graph_id))
 
-        nodes = fetch_all_nodes(self.client, graph_id)
+        nodes = self.provider.list_nodes(graph_id)
 
         result = []
         for node in nodes:
@@ -688,7 +681,7 @@ class ZepToolsService:
         """
         logger.info(t("console.fetchingAllEdges", graphId=graph_id))
 
-        edges = fetch_all_edges(self.client, graph_id)
+        edges = self.provider.list_edges(graph_id)
 
         result = []
         for edge in edges:
@@ -727,7 +720,7 @@ class ZepToolsService:
         
         try:
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                func=lambda: self.provider.get_node(node_uuid),
                 operation_name=t("console.fetchNodeDetailOp", uuid=node_uuid[:8])
             )
             
