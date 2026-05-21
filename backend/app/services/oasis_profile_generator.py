@@ -15,9 +15,10 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from ..config import Config
+from ..utils.llm_client import _wait_for_glm_rate_slot
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
 from .graph_memory_provider import GraphMemorySearchOptions, create_graph_memory_provider
@@ -195,7 +196,12 @@ class OasisProfileGenerator:
         
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=float(os.environ.get("MIROFISH_LLM_TIMEOUT_SECONDS", "180")),
+            http_client=DefaultHttpxClient(
+                timeout=float(os.environ.get("MIROFISH_LLM_TIMEOUT_SECONDS", "180")),
+                trust_env=False,
+            ),
         )
         
         # 图谱记忆 provider 用于检索丰富上下文
@@ -232,8 +238,9 @@ class OasisProfileGenerator:
         name = entity.name
         user_name = self._generate_username(name)
         
-        # 构建上下文信息
-        context = self._build_entity_context(entity)
+        # 规则化 profile 不消费上下文，跳过每实体 Graphiti/Zep 检索，
+        # 避免 200+ 实体日更 prepare 被检索超时拖慢。
+        context = self._build_entity_context(entity) if use_llm else ""
         
         if use_llm:
             # 使用LLM生成详细人设
@@ -523,6 +530,7 @@ class OasisProfileGenerator:
         
         for attempt in range(max_attempts):
             try:
+                _wait_for_glm_rate_slot(self.model_name)
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[

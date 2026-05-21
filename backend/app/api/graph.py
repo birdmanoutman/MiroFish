@@ -31,6 +31,115 @@ def allowed_file(filename: str) -> bool:
     return ext in Config.ALLOWED_EXTENSIONS
 
 
+def _stock_sentiment_ontology(fallback_reason: str = "") -> dict:
+    summary = (
+        "A-share daily sentiment simulation ontology for OUTBIRD. "
+        "It models listed companies, market themes, institutional money, "
+        "retail crowd behavior, media narratives, and risk events."
+    )
+    if fallback_reason:
+        summary += f" Static fallback was used because ontology LLM generation failed: {fallback_reason[:240]}"
+    return {
+        "analysis_summary": summary,
+        "entity_types": [
+            {
+                "name": "ListedCompany",
+                "description": "A publicly traded A-share company tracked by daily sentiment analysis.",
+                "attributes": [
+                    {"name": "stock_code", "type": "text", "description": "A-share ticker code."},
+                    {"name": "sector_keywords", "type": "text", "description": "Industry or concept labels."},
+                ],
+            },
+            {
+                "name": "MarketTheme",
+                "description": "A sector, concept, macro theme, or event narrative that moves a group of stocks.",
+                "attributes": [
+                    {"name": "theme_name", "type": "text", "description": "Theme label."},
+                    {"name": "sentiment_direction", "type": "text", "description": "bullish, bearish, or mixed."},
+                ],
+            },
+            {
+                "name": "InstitutionalInvestor",
+                "description": "Funds, brokers, insurance capital, or other professional market participants.",
+                "attributes": [
+                    {"name": "org_name", "type": "text", "description": "Organization name."},
+                    {"name": "capital_flow", "type": "text", "description": "Flow direction or intensity."},
+                ],
+            },
+            {
+                "name": "RetailCrowd",
+                "description": "Retail investor crowd or online community expressing market sentiment.",
+                "attributes": [
+                    {"name": "platform", "type": "text", "description": "Social platform or community."},
+                    {"name": "mood", "type": "text", "description": "Dominant crowd mood."},
+                ],
+            },
+            {
+                "name": "FinancialMedia",
+                "description": "Media, analyst reports, or news sources amplifying market narratives.",
+                "attributes": [
+                    {"name": "source_name", "type": "text", "description": "Media or source name."},
+                    {"name": "coverage_focus", "type": "text", "description": "Main covered topic."},
+                ],
+            },
+            {
+                "name": "RiskEvent",
+                "description": "A negative event, volatility trigger, regulation item, or sentiment reversal catalyst.",
+                "attributes": [
+                    {"name": "risk_type", "type": "text", "description": "Risk category."},
+                    {"name": "severity", "type": "text", "description": "Risk severity."},
+                ],
+            },
+        ],
+        "edge_types": [
+            {
+                "name": "BELONGS_TO_THEME",
+                "description": "A listed company belongs to or is affected by a market theme.",
+                "source_targets": [{"source": "ListedCompany", "target": "MarketTheme"}],
+                "attributes": [],
+            },
+            {
+                "name": "DRIVES_SENTIMENT",
+                "description": "A theme, media source, or crowd group drives sentiment for a company.",
+                "source_targets": [
+                    {"source": "MarketTheme", "target": "ListedCompany"},
+                    {"source": "FinancialMedia", "target": "ListedCompany"},
+                    {"source": "RetailCrowd", "target": "ListedCompany"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "ALLOCATES_TO",
+                "description": "Institutional capital flows into or out of a listed company or theme.",
+                "source_targets": [
+                    {"source": "InstitutionalInvestor", "target": "ListedCompany"},
+                    {"source": "InstitutionalInvestor", "target": "MarketTheme"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "AMPLIFIES",
+                "description": "Media or retail crowd amplifies a theme or narrative.",
+                "source_targets": [
+                    {"source": "FinancialMedia", "target": "MarketTheme"},
+                    {"source": "RetailCrowd", "target": "MarketTheme"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "TRIGGERS_RISK",
+                "description": "A risk event affects a company, crowd, or market theme.",
+                "source_targets": [
+                    {"source": "RiskEvent", "target": "ListedCompany"},
+                    {"source": "RiskEvent", "target": "MarketTheme"},
+                    {"source": "RiskEvent", "target": "RetailCrowd"},
+                ],
+                "attributes": [],
+            },
+        ],
+    }
+
+
 # ============== 项目管理接口 ==============
 
 @graph_bp.route('/project/<project_id>', methods=['GET'])
@@ -214,12 +323,19 @@ def generate_ontology():
         
         # 生成本体
         logger.info("调用 LLM 生成本体定义...")
-        generator = OntologyGenerator()
-        ontology = generator.generate(
-            document_texts=document_texts,
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None
-        )
+        try:
+            generator = OntologyGenerator()
+            ontology = generator.generate(
+                document_texts=document_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context if additional_context else None
+            )
+        except Exception as ontology_error:
+            fallback_mode = os.environ.get("MIROFISH_ONTOLOGY_FALLBACK", "static").strip().lower()
+            if fallback_mode not in {"1", "true", "yes", "on", "static"}:
+                raise
+            logger.warning(f"LLM 本体生成失败，使用静态 A 股情绪本体兜底: {ontology_error}")
+            ontology = _stock_sentiment_ontology(str(ontology_error))
         
         # 保存本体到项目
         entity_count = len(ontology.get("entity_types", []))
@@ -267,7 +383,8 @@ def build_graph():
             "project_id": "proj_xxxx",  // 必填，来自接口1
             "graph_name": "图谱名称",    // 可选
             "chunk_size": 500,          // 可选，默认500
-            "chunk_overlap": 50         // 可选，默认50
+            "chunk_overlap": 50,        // 可选，默认50
+            "batch_size": 1             // 可选，默认1，避免大批量写图卡住
         }
         
     返回：
@@ -338,6 +455,8 @@ def build_graph():
         graph_name = data.get('graph_name', project.name or 'MiroFish Graph')
         chunk_size = data.get('chunk_size', project.chunk_size or Config.DEFAULT_CHUNK_SIZE)
         chunk_overlap = data.get('chunk_overlap', project.chunk_overlap or Config.DEFAULT_CHUNK_OVERLAP)
+        batch_size = int(data.get('batch_size', os.environ.get('GRAPHITI_GRAPH_BATCH_SIZE', '1')))
+        batch_size = max(1, min(batch_size, 5))
         
         # 更新项目配置
         project.chunk_size = chunk_size
@@ -438,7 +557,7 @@ def build_graph():
                 episode_uuids = builder.add_text_batches(
                     graph_id, 
                     chunks,
-                    batch_size=3,
+                    batch_size=batch_size,
                     progress_callback=add_progress_callback
                 )
                 

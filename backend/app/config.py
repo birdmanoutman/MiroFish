@@ -30,7 +30,7 @@ class Config:
     # LLM配置（统一使用OpenAI格式）
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
-    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'glm-5-cn')
     
     # Graph memory配置。生产默认使用本地 Graphiti；Zep Cloud 保留为回退。
     MEMORY_PROVIDER = os.environ.get('MEMORY_PROVIDER', 'graphiti').lower()
@@ -45,12 +45,27 @@ class Config:
     GRAPHITI_NEO4J_PASSWORD = os.environ.get('GRAPHITI_NEO4J_PASSWORD')
     GRAPHITI_API_KEY = os.environ.get('GRAPHITI_API_KEY')
     GRAPHITI_LLM_BASE_URL = os.environ.get('GRAPHITI_LLM_BASE_URL', LLM_BASE_URL)
-    GRAPHITI_LLM_MODEL_NAME = os.environ.get('GRAPHITI_LLM_MODEL_NAME', 'gpt-4.1-mini')
-    GRAPHITI_SMALL_MODEL_NAME = os.environ.get('GRAPHITI_SMALL_MODEL_NAME', 'gpt-4.1-nano')
+    GRAPHITI_LLM_MODEL_NAME = os.environ.get('GRAPHITI_LLM_MODEL_NAME', 'glm-5-cn')
+    GRAPHITI_SMALL_MODEL_NAME = os.environ.get('GRAPHITI_SMALL_MODEL_NAME', 'glm-5-cn')
     GRAPHITI_EMBEDDING_BASE_URL = os.environ.get('GRAPHITI_EMBEDDING_BASE_URL', LLM_BASE_URL)
     GRAPHITI_EMBEDDING_MODEL = os.environ.get('GRAPHITI_EMBEDDING_MODEL', 'text-embedding-3-small')
     GRAPHITI_EMBEDDING_DIM = int(os.environ.get('GRAPHITI_EMBEDDING_DIM', '1024'))
-    GRAPHITI_EPISODE_TIMEOUT_SECONDS = int(os.environ.get('GRAPHITI_EPISODE_TIMEOUT_SECONDS', '90'))
+    GRAPHITI_EPISODE_TIMEOUT_SECONDS = int(os.environ.get('GRAPHITI_EPISODE_TIMEOUT_SECONDS', '300'))
+    GRAPHITI_MAX_COROUTINES = int(os.environ.get('GRAPHITI_MAX_COROUTINES', '1'))
+    GRAPHITI_LLM_RPM_LIMIT = int(os.environ.get('OUTBIRD_GLM_RPM_LIMIT', os.environ.get('GRAPHITI_LLM_RPM_LIMIT', '18')))
+    GRAPHITI_LLM_RATE_WINDOW_SECONDS = float(
+        os.environ.get('OUTBIRD_GLM_RATE_WINDOW_SECONDS', os.environ.get('GRAPHITI_LLM_RATE_WINDOW_SECONDS', '60'))
+    )
+    GRAPHITI_LLM_MIN_INTERVAL_SECONDS = float(
+        os.environ.get(
+            'OUTBIRD_GLM_MIN_INTERVAL_SECONDS',
+            os.environ.get('GRAPHITI_LLM_MIN_INTERVAL_SECONDS', str(GRAPHITI_LLM_RATE_WINDOW_SECONDS / GRAPHITI_LLM_RPM_LIMIT)),
+        )
+    )
+    GRAPHITI_LLM_RATE_LIMIT_PATH = os.environ.get(
+        'OUTBIRD_GLM_RATE_LIMIT_PATH',
+        os.environ.get('GRAPHITI_LLM_RATE_LIMIT_PATH', '/tmp/outbird_glm_rate_limiter.json'),
+    )
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB

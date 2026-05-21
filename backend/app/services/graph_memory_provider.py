@@ -10,9 +10,12 @@ report retrieval paths.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
+import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -112,10 +115,12 @@ def _public_attributes(value: Any) -> Dict[str, Any]:
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
     cleaned = (text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").strip()
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned).strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned, flags=re.IGNORECASE)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    if not cleaned:
+        raise ValueError("LLM response is empty; expected JSON object")
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
@@ -124,6 +129,115 @@ def _parse_json_object(text: str) -> Dict[str, Any]:
         if start >= 0 and end > start:
             return json.loads(cleaned[start : end + 1])
         raise
+
+
+def _message_text_candidates(message: Any) -> List[str]:
+    """Return possible text payloads from OpenAI-compatible message variants."""
+    values: List[Any] = [
+        getattr(message, "content", None),
+        getattr(message, "reasoning_content", None),
+    ]
+    if hasattr(message, "model_dump"):
+        try:
+            dumped = message.model_dump()
+            values.extend([dumped.get("content"), dumped.get("reasoning_content")])
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            parts: List[str] = []
+            for part in value:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    parts.append(str(part))
+            text = "\n".join(part for part in parts if part).strip()
+        else:
+            text = str(value).strip()
+        if text and text not in seen:
+            candidates.append(text)
+            seen.add(text)
+    return candidates
+
+
+def _wait_for_glm_rate_slot(model: str) -> None:
+    if "glm" not in str(model).lower():
+        return
+
+    limit = max(1, Config.GRAPHITI_LLM_RPM_LIMIT)
+    window_seconds = max(1.0, Config.GRAPHITI_LLM_RATE_WINDOW_SECONDS)
+    min_interval_seconds = max(0.0, Config.GRAPHITI_LLM_MIN_INTERVAL_SECONDS)
+    rate_path = Path(Config.GRAPHITI_LLM_RATE_LIMIT_PATH)
+    rate_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = rate_path.with_suffix(rate_path.suffix + ".lock")
+
+    while True:
+        now = time.monotonic()
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    payload = json.loads(rate_path.read_text(encoding="utf-8"))
+                    timestamps = [float(item) for item in payload.get("timestamps", [])]
+                except Exception:
+                    timestamps = []
+
+                timestamps = [ts for ts in timestamps if now - ts < window_seconds]
+                wait_for_interval = 0.0
+                if timestamps and min_interval_seconds:
+                    wait_for_interval = min_interval_seconds - (now - max(timestamps))
+                wait_for_window = 0.0
+                if len(timestamps) >= limit:
+                    wait_for_window = window_seconds - (now - min(timestamps))
+
+                wait_seconds = max(wait_for_interval, wait_for_window, 0.0)
+                if wait_seconds <= 0:
+                    timestamps.append(now)
+                    rate_path.write_text(
+                        json.dumps({"timestamps": timestamps}, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    return
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        time.sleep(max(0.1, wait_seconds))
+
+
+class _ThrottledAsyncChatCompletions:
+    def __init__(self, completions: Any, default_model: str):
+        self._completions = completions
+        self._default_model = default_model
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._completions, name)
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model") or self._default_model
+        await asyncio.to_thread(_wait_for_glm_rate_slot, str(model))
+        return await self._completions.create(*args, **kwargs)
+
+
+class _ThrottledAsyncChat:
+    def __init__(self, chat: Any, default_model: str):
+        self._chat = chat
+        self.completions = _ThrottledAsyncChatCompletions(chat.completions, default_model)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+class _ThrottledAsyncOpenAI:
+    def __init__(self, client: Any, default_model: str):
+        self._client = client
+        self.chat = _ThrottledAsyncChat(client.chat, default_model)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
 
 
 def _safe_attr_name(attr_name: str, reserved_names: set[str]) -> str:
@@ -312,6 +426,7 @@ class GraphitiProvider:
         self.embedding_model = Config.GRAPHITI_EMBEDDING_MODEL
         self.embedding_dim = Config.GRAPHITI_EMBEDDING_DIM
         self.episode_timeout_seconds = Config.GRAPHITI_EPISODE_TIMEOUT_SECONDS
+        self.max_coroutines = Config.GRAPHITI_MAX_COROUTINES
         self._ontology_by_graph_id = self._load_ontology_registry()
 
         if client is None:
@@ -357,7 +472,63 @@ class GraphitiProvider:
 
         class MiroFishOpenAIGenericClient(OpenAIGenericClient):
             @staticmethod
-            def _normalize_for_model(payload: Dict[str, Any]) -> Dict[str, Any]:
+            def _json_schema_response_format(response_model: type[BaseModel]) -> Dict[str, Any]:
+                schema_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", response_model.__name__)[:64]
+                if not schema_name:
+                    schema_name = "graphiti_response"
+                return {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "schema": response_model.model_json_schema(),
+                        "strict": False,
+                    },
+                }
+
+            @staticmethod
+            def _fallback_field_value(field_name: str, field: Any, normalized: Dict[str, Any]) -> Any:
+                properties = normalized.get("properties")
+                if isinstance(properties, dict):
+                    if field_name in properties:
+                        return properties[field_name]
+                    if "summary" in properties:
+                        return str(properties["summary"])
+                if field_name in {"stock_code", "ticker", "code"}:
+                    text = json.dumps(normalized, ensure_ascii=False)
+                    import re
+
+                    match = re.search(r"\b(?:SH|SZ)?[0-9]{6}\b", text)
+                    return match.group(0) if match else ""
+                if field_name in {"main_business", "data_source", "system_name", "org_name", "full_name"}:
+                    return str(normalized.get("summary") or normalized.get("name") or "")
+
+                annotation = getattr(field, "annotation", None)
+                origin = getattr(annotation, "__origin__", None)
+                if annotation in {int, float}:
+                    return 0
+                if annotation is bool:
+                    return False
+                if annotation is dict or origin is dict:
+                    return {}
+                if annotation is list or origin is list:
+                    return []
+                return str(normalized.get("summary") or "")
+
+            @classmethod
+            def _fallback_model_dump(
+                cls,
+                response_model: type[BaseModel],
+                payload: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                normalized = cls._normalize_for_model(payload or {}, response_model)
+                return response_model.model_validate(normalized).model_dump()
+
+            @classmethod
+            def _normalize_for_model(
+                cls,
+                payload: Dict[str, Any],
+                response_model: type[BaseModel] | None = None,
+            ) -> Dict[str, Any]:
                 normalized = dict(payload)
                 for key, value in list(normalized.items()):
                     if isinstance(value, dict):
@@ -371,6 +542,17 @@ class GraphitiProvider:
                             normalized[key] = value["text"]
                 if "summary" not in normalized and "properties" in normalized:
                     normalized["summary"] = str(normalized["properties"])
+                if response_model is not None:
+                    for field_name, field in getattr(response_model, "model_fields", {}).items():
+                        if field_name in normalized and normalized[field_name] is not None:
+                            continue
+                        is_required = getattr(field, "is_required", lambda: False)
+                        if is_required():
+                            normalized[field_name] = cls._fallback_field_value(
+                                field_name,
+                                field,
+                                normalized,
+                            )
                 return normalized
 
             async def _generate_response(
@@ -388,22 +570,91 @@ class GraphitiProvider:
                     elif message.role == "system":
                         openai_messages.append({"role": "system", "content": message.content})
 
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=openai_messages,
-                    temperature=self.temperature,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
-                )
-                result = response.choices[0].message.content or ""
-                payload = _parse_json_object(result)
-                if response_model is None:
-                    return payload
-                try:
-                    return response_model.model_validate(payload).model_dump()
-                except Exception:
-                    normalized = self._normalize_for_model(payload)
-                    return response_model.model_validate(normalized).model_dump()
+                json_system_message = {
+                    "role": "system",
+                    "content": (
+                        "Return exactly one valid JSON object. Do not include markdown, "
+                        "code fences, prose, or explanations outside JSON."
+                    ),
+                }
+                model_name = str(self.model).lower()
+                attempts = [
+                    (openai_messages, True),
+                    ([json_system_message, *openai_messages], True),
+                    ([json_system_message, *openai_messages], False),
+                ]
+                last_error: Optional[BaseException] = None
+
+                for attempt_index, (messages_payload, use_response_format) in enumerate(attempts):
+                    output_token_limit = int(os.environ.get("GRAPHITI_LLM_MAX_TOKENS", "1024"))
+                    request_kwargs = {
+                        "model": self.model,
+                        "messages": messages_payload,
+                        "temperature": 0 if attempt_index else self.temperature,
+                        "max_tokens": min(max_tokens, output_token_limit),
+                    }
+                    response_format: Optional[Dict[str, Any]] = None
+                    if use_response_format:
+                        if (
+                            "qwen3.6" in model_name
+                            and response_model is not None
+                            and os.environ.get("GRAPHITI_QWEN_JSON_SCHEMA") == "1"
+                        ):
+                            response_format = self._json_schema_response_format(response_model)
+                        elif "qwen3.6" not in model_name:
+                            response_format = {"type": "json_object"}
+                    if response_format is not None:
+                        request_kwargs["response_format"] = response_format
+
+                    try:
+                        response = await self.client.chat.completions.create(**request_kwargs)
+                    except Exception as exc:
+                        if (
+                            response_format is None
+                            or ("response_format.type" not in str(exc) and "json_object" not in str(exc))
+                        ):
+                            last_error = exc
+                            continue
+                        request_kwargs.pop("response_format", None)
+                        try:
+                            response = await self.client.chat.completions.create(**request_kwargs)
+                        except Exception as retry_exc:
+                            last_error = retry_exc
+                            continue
+
+                    payload: Optional[Dict[str, Any]] = None
+                    for result in _message_text_candidates(response.choices[0].message):
+                        try:
+                            payload = _parse_json_object(result)
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                    if payload is None:
+                        continue
+
+                    if response_model is None:
+                        return payload
+                    try:
+                        return response_model.model_validate(payload).model_dump()
+                    except Exception as exc:
+                        last_error = exc
+                        try:
+                            normalized = self._normalize_for_model(payload, response_model)
+                            return response_model.model_validate(normalized).model_dump()
+                        except Exception as normalized_exc:
+                            last_error = normalized_exc
+
+                if response_model is not None:
+                    return self._fallback_model_dump(response_model)
+                if last_error is not None:
+                    raise last_error
+                raise ValueError("LLM response did not contain a JSON object")
+
+        class MiroFishOpenAIEmbedder(OpenAIEmbedder):
+            async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+                if not input_data_list:
+                    return []
+                return await super().create_batch(input_data_list)
 
         llm_config = LLMConfig(
             api_key=self.api_key,
@@ -417,20 +668,26 @@ class GraphitiProvider:
             embedding_model=self.embedding_model,
             embedding_dim=self.embedding_dim,
         )
-        llm_openai_client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.llm_base_url,
-            http_client=httpx.AsyncClient(trust_env=False),
+        llm_openai_client = _ThrottledAsyncOpenAI(
+            AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.llm_base_url,
+                http_client=httpx.AsyncClient(trust_env=False),
+            ),
+            self.llm_model,
         )
         embedding_openai_client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.embedding_base_url,
             http_client=httpx.AsyncClient(trust_env=False),
         )
-        reranker_openai_client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.llm_base_url,
-            http_client=httpx.AsyncClient(trust_env=False),
+        reranker_openai_client = _ThrottledAsyncOpenAI(
+            AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.llm_base_url,
+                http_client=httpx.AsyncClient(trust_env=False),
+            ),
+            self.llm_model,
         )
 
         graphiti = Graphiti(
@@ -438,9 +695,9 @@ class GraphitiProvider:
             self.neo4j_user,
             self.neo4j_password,
             llm_client=MiroFishOpenAIGenericClient(config=llm_config, client=llm_openai_client),
-            embedder=OpenAIEmbedder(config=embedder_config, client=embedding_openai_client),
+            embedder=MiroFishOpenAIEmbedder(config=embedder_config, client=embedding_openai_client),
             cross_encoder=OpenAIRerankerClient(config=llm_config, client=reranker_openai_client),
-            max_coroutines=4,
+            max_coroutines=self.max_coroutines,
         )
         graphiti._mirofish_openai_clients = [llm_openai_client, embedding_openai_client, reranker_openai_client]
         return graphiti

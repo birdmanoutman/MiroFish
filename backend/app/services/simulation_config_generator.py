@@ -12,13 +12,16 @@
 
 import json
 import math
+import os
+import re
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from ..config import Config
+from ..utils.llm_client import _wait_for_glm_rate_slot
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from .zep_entity_reader import EntityNode, ZepEntityReader
@@ -231,13 +234,20 @@ class SimulationConfigGenerator:
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
+        self.config_mode = os.environ.get("MIROFISH_SIM_CONFIG_MODE", "auto").strip().lower()
+        self.rule_entity_threshold = int(os.environ.get("MIROFISH_SIM_RULE_ENTITY_THRESHOLD", "120"))
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
         
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=float(os.environ.get("MIROFISH_LLM_TIMEOUT_SECONDS", "180")),
+            http_client=DefaultHttpxClient(
+                timeout=float(os.environ.get("MIROFISH_LLM_TIMEOUT_SECONDS", "180")),
+                trust_env=False,
+            ),
         )
     
     def generate_config(
@@ -270,6 +280,26 @@ class SimulationConfigGenerator:
             SimulationParameters: 完整的模拟参数
         """
         logger.info(f"开始智能生成模拟配置: simulation_id={simulation_id}, 实体数={len(entities)}")
+
+        if self.config_mode in {"rule", "rules", "deterministic", "fast"} or (
+            self.config_mode == "auto" and len(entities) >= self.rule_entity_threshold
+        ):
+            logger.info(
+                "使用规则化模拟配置: mode=%s, threshold=%s, entities=%s",
+                self.config_mode,
+                self.rule_entity_threshold,
+                len(entities),
+            )
+            return self._generate_rule_based_config(
+                simulation_id=simulation_id,
+                project_id=project_id,
+                graph_id=graph_id,
+                simulation_requirement=simulation_requirement,
+                document_text=document_text,
+                entities=entities,
+                enable_twitter=enable_twitter,
+                enable_reddit=enable_reddit,
+            )
         
         # 计算总步骤数
         num_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
@@ -377,6 +407,202 @@ class SimulationConfigGenerator:
         logger.info(f"模拟配置生成完成: {len(params.agent_configs)} 个Agent配置")
         
         return params
+
+    def _generate_rule_based_config(
+        self,
+        simulation_id: str,
+        project_id: str,
+        graph_id: str,
+        simulation_requirement: str,
+        document_text: str,
+        entities: List[EntityNode],
+        enable_twitter: bool = True,
+        enable_reddit: bool = True,
+    ) -> SimulationParameters:
+        """Generate a deterministic config for large operational simulations."""
+        num_entities = len(entities)
+        time_result = self._get_default_time_config(num_entities)
+        if num_entities >= 120:
+            time_result.update(
+                {
+                    "total_simulation_hours": 120,
+                    "agents_per_hour_min": max(10, num_entities // 15),
+                    "agents_per_hour_max": max(30, min(num_entities, int(num_entities * 0.6))),
+                    "reasoning": "大规模日频量化图谱使用规则化配置，避免长批次LLM生成导致后端任务丢失",
+                }
+            )
+        time_config = self._parse_time_config(time_result, num_entities)
+
+        agent_configs: List[AgentActivityConfig] = []
+        for idx, entity in enumerate(entities):
+            cfg = self._generate_agent_config_by_rule(entity)
+            sentiment_bias = self._infer_sentiment_bias(entity.summary)
+            cfg["sentiment_bias"] = sentiment_bias
+            cfg["stance"] = self._stance_from_bias(sentiment_bias)
+            impact_weight = self._infer_influence_weight(entity.summary)
+            if impact_weight is not None:
+                cfg["influence_weight"] = impact_weight
+            agent_configs.append(
+                AgentActivityConfig(
+                    agent_id=idx,
+                    entity_uuid=entity.uuid,
+                    entity_name=entity.name,
+                    entity_type=entity.get_entity_type() or "Unknown",
+                    activity_level=cfg.get("activity_level", 0.5),
+                    posts_per_hour=cfg.get("posts_per_hour", 0.5),
+                    comments_per_hour=cfg.get("comments_per_hour", 1.0),
+                    active_hours=cfg.get("active_hours", list(range(9, 23))),
+                    response_delay_min=cfg.get("response_delay_min", 5),
+                    response_delay_max=cfg.get("response_delay_max", 60),
+                    sentiment_bias=cfg.get("sentiment_bias", 0.0),
+                    stance=cfg.get("stance", "neutral"),
+                    influence_weight=cfg.get("influence_weight", 1.0),
+                )
+            )
+
+        event_config = self._generate_rule_based_event_config(
+            simulation_requirement=simulation_requirement,
+            document_text=document_text,
+            entities=entities,
+        )
+        event_config = self._assign_initial_post_agents(event_config, agent_configs)
+
+        twitter_config = None
+        reddit_config = None
+        if enable_twitter:
+            twitter_config = PlatformConfig(
+                platform="twitter",
+                recency_weight=0.4,
+                popularity_weight=0.3,
+                relevance_weight=0.3,
+                viral_threshold=10,
+                echo_chamber_strength=0.5,
+            )
+        if enable_reddit:
+            reddit_config = PlatformConfig(
+                platform="reddit",
+                recency_weight=0.3,
+                popularity_weight=0.4,
+                relevance_weight=0.3,
+                viral_threshold=15,
+                echo_chamber_strength=0.6,
+            )
+
+        return SimulationParameters(
+            simulation_id=simulation_id,
+            project_id=project_id,
+            graph_id=graph_id,
+            simulation_requirement=simulation_requirement,
+            time_config=time_config,
+            agent_configs=agent_configs,
+            event_config=event_config,
+            twitter_config=twitter_config,
+            reddit_config=reddit_config,
+            llm_model=self.model_name,
+            llm_base_url=self.base_url,
+            generation_reasoning=(
+                f"规则化配置: entities={num_entities}, mode={self.config_mode}, "
+                f"threshold={self.rule_entity_threshold}; "
+                "大型日频量化模拟跳过逐批LLM agent config，使用BettaFish情绪摘要中的分数派生立场和影响权重"
+            ),
+        )
+
+    def _generate_rule_based_event_config(
+        self,
+        simulation_requirement: str,
+        document_text: str,
+        entities: List[EntityNode],
+    ) -> EventConfig:
+        entity_types = [e.get_entity_type() or "Organization" for e in entities]
+
+        def pick_type(preferred: List[str]) -> str:
+            for item in preferred:
+                if item in entity_types:
+                    return item
+            return entity_types[0] if entity_types else "Organization"
+
+        topics = self._extract_rule_hot_topics(document_text)
+        if not topics:
+            topics = ["A股情绪快照", "AI算力", "半导体", "券商资金面", "消费白酒", "新能源"]
+
+        initial_posts = [
+            {
+                "content": "OUTBIRD 日频200标的 BettaFish 情绪快照已更新，市场关注叙事扩散、板块轮动与风险传导。",
+                "poster_type": pick_type(["Organization"]),
+            },
+            {
+                "content": "AI算力和半导体链仍是高影响主题，强势标的可能继续吸引短线资金和社媒讨论。",
+                "poster_type": pick_type(["TechCompany", "ManufacturingCompany"]),
+            },
+            {
+                "content": "券商和资金面信号需要和高分情绪一起观察，过热叙事可能在盘中出现反转。",
+                "poster_type": pick_type(["SecuritiesFirm", "Bank", "Organization"]),
+            },
+            {
+                "content": "消费、白酒、新能源和周期资源板块的低分标的可能成为风险扩散的先行区域。",
+                "poster_type": pick_type(["ConsumerCompany", "EnergyCompany", "ManufacturingCompany"]),
+            },
+        ]
+
+        return EventConfig(
+            initial_posts=initial_posts,
+            scheduled_events=[],
+            hot_topics=topics,
+            narrative_direction=(
+                simulation_requirement
+                or "围绕A股日频情绪快照推演资金关注、叙事扩散、情绪反转与板块轮动。"
+            ),
+        )
+
+    def _extract_rule_hot_topics(self, document_text: str) -> List[str]:
+        candidates = [
+            "AI算力",
+            "半导体",
+            "券商",
+            "白酒",
+            "新能源",
+            "光模块",
+            "银行",
+            "医药",
+            "消费",
+            "有色金属",
+            "军工",
+            "地产",
+            "机器人",
+        ]
+        return [topic for topic in candidates if topic in document_text][:8]
+
+    def _infer_sentiment_bias(self, summary: str) -> float:
+        score = self._extract_first_score(summary, ["看涨", "看多", "bullish"])
+        if score is None:
+            return 0.0
+        return max(-1.0, min(1.0, (score - 50.0) / 50.0))
+
+    def _infer_influence_weight(self, summary: str) -> Optional[float]:
+        score = self._extract_first_score(summary, ["影响", "impact"])
+        if score is None:
+            return None
+        return max(0.6, min(2.0, 0.6 + score / 70.0))
+
+    def _extract_first_score(self, summary: str, labels: List[str]) -> Optional[float]:
+        if not summary:
+            return None
+        for label in labels:
+            pattern = rf"{re.escape(label)}[^0-9]{{0,12}}([0-9]{{1,3}}(?:\\.[0-9]+)?)"
+            match = re.search(pattern, summary, flags=re.IGNORECASE)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    def _stance_from_bias(self, bias: float) -> str:
+        if bias >= 0.25:
+            return "supportive"
+        if bias <= -0.25:
+            return "opposing"
+        return "neutral"
     
     def _build_context(
         self,
@@ -440,6 +666,7 @@ class SimulationConfigGenerator:
         
         for attempt in range(max_attempts):
             try:
+                _wait_for_glm_rate_slot(self.model_name)
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -988,4 +1215,3 @@ class SimulationConfigGenerator:
                 "influence_weight": 1.0
             }
     
-
