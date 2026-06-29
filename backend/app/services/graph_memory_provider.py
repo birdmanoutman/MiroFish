@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import re
 import threading
@@ -28,8 +29,71 @@ from pydantic import BaseModel, Field, create_model
 from ..config import Config
 
 
+logger = logging.getLogger(__name__)
+
+
 OntologyEntityTypes = Dict[str, Any]
 OntologyEdgeTypes = Dict[str, Any]
+
+
+_GRAPHITI_EDGE_GUARD_INSTALLED = False
+
+
+def _install_graphiti_edge_resolution_guard() -> None:
+    """Make Graphiti tolerant of extracted edges with unresolved endpoints.
+
+    graphiti-core 0.13.2's ``resolve_extracted_edges`` indexes
+    ``uuid_entity_map[edge.source_node_uuid]`` directly. Local LLM backends
+    (GLM / qwen via LiteLLM) occasionally emit an extracted edge whose
+    source/target node UUID drops out during node dedup/resolution, so that
+    single stray edge raises ``KeyError`` and aborts ingestion of the entire
+    episode batch (observed in the MiroFish daily-sentiment push). We wrap the
+    upstream function and drop edges whose endpoints are absent from the
+    resolved entity set before delegating, so the episode still commits its
+    valid nodes and edges instead of failing wholesale.
+
+    Idempotent and signature-tolerant: we only sanitize the input list and
+    forward the remaining args to the original implementation.
+    """
+    global _GRAPHITI_EDGE_GUARD_INSTALLED
+    if _GRAPHITI_EDGE_GUARD_INSTALLED:
+        return
+
+    from graphiti_core import graphiti as graphiti_module
+    from graphiti_core.utils.maintenance import edge_operations
+
+    original = edge_operations.resolve_extracted_edges
+    if getattr(original, "_mirofish_edge_guard", False):
+        _GRAPHITI_EDGE_GUARD_INSTALLED = True
+        return
+
+    async def resolve_extracted_edges_guarded(clients, extracted_edges, episode, entities, *args, **kwargs):
+        valid_uuids = {entity.uuid for entity in entities}
+        filtered = [
+            edge
+            for edge in extracted_edges
+            if edge.source_node_uuid in valid_uuids and edge.target_node_uuid in valid_uuids
+        ]
+        dropped = len(extracted_edges) - len(filtered)
+        if dropped:
+            logger.warning(
+                "Dropped %d extracted edge(s) with unresolved endpoint UUIDs before "
+                "Graphiti edge resolution (episode=%s)",
+                dropped,
+                getattr(episode, "uuid", "?"),
+            )
+        return await original(clients, filtered, episode, entities, *args, **kwargs)
+
+    resolve_extracted_edges_guarded._mirofish_edge_guard = True
+
+    edge_operations.resolve_extracted_edges = resolve_extracted_edges_guarded
+    # graphiti.py imported the symbol by name, so its module namespace holds an
+    # independent binding that must be patched too.
+    if hasattr(graphiti_module, "resolve_extracted_edges"):
+        graphiti_module.resolve_extracted_edges = resolve_extracted_edges_guarded
+
+    _GRAPHITI_EDGE_GUARD_INSTALLED = True
+    logger.info("Installed MiroFish Graphiti edge-resolution guard")
 
 
 @dataclass(frozen=True)
@@ -461,6 +525,8 @@ class GraphitiProvider:
         return result.get("value")
 
     def _create_graphiti(self) -> Any:
+        _install_graphiti_edge_resolution_guard()
+
         from graphiti_core import Graphiti
         from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
